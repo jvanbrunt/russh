@@ -20,6 +20,7 @@ pub mod dh;
 mod ecdh_nistp;
 mod none;
 use std::cell::RefCell;
+use crate::debug;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::Debug;
@@ -76,13 +77,22 @@ impl<K> SessionKexState<K> {
 
     pub fn take(&mut self) -> Self {
         // TODO maybe make this take a guarded closure
-        std::mem::replace(
-            self,
-            match self {
-                SessionKexState::Idle => SessionKexState::Idle,
-                _ => SessionKexState::Taken,
+        let next_state = match self {
+            SessionKexState::Idle => {
+                debug::log_kex_event("any", "kex state transition: Idle → Taken", None);
+                SessionKexState::Idle
             },
-        )
+            SessionKexState::InProgress(_) => {
+                debug::log_kex_event("any", "kex state transition: InProgress → Taken", None);
+                SessionKexState::Taken
+            },
+            SessionKexState::Taken => {
+                debug::log_kex_event("any", "kex state transition: Taken → Taken", None);
+                SessionKexState::Taken
+            },
+        };
+        
+        std::mem::replace(self, next_state)
     }
 }
 
@@ -94,14 +104,26 @@ pub(crate) enum KexCause {
 
 impl KexCause {
     pub fn is_strict_kex(&self, names: &Names) -> bool {
-        names.strict_kex || matches!(self, Self::Rekey { strict: true, .. })
+        let result = names.strict_kex || matches!(self, Self::Rekey { strict: true, .. });
+        if result {
+            debug::log_kex_event("any", "strict kex required", None);
+        }
+        result
     }
 
     pub fn is_rekey(&self) -> bool {
-        match self {
+        let result = match self {
             Self::Initial => false,
             Self::Rekey { .. } => true,
+        };
+        
+        if result {
+            debug::log_kex_event("any", "rekey operation", None);
+        } else {
+            debug::log_kex_event("any", "initial key exchange", None);
         }
+        
+        result
     }
 
     pub fn session_id(&self) -> Option<&CryptoVec> {
@@ -154,38 +176,107 @@ pub(crate) trait KexAlgorithmImplementor {
         false
     }
 
+    fn log_algorithm_info(&self) {
+        // Implemented by specific algorithms to log their details
+        debug::log_event("kex", "using default algorithm implementation", log::Level::Debug);
+    }
+
+    #[allow(unused_variables)]
     #[allow(unused_variables)]
     fn client_dh_gex_init(
         &mut self,
         gex: &GexParams,
         writer: &mut impl Writer,
     ) -> Result<(), Error> {
+        debug::log_kex_event("dh-gex", "client_dh_gex_init not implemented for this algorithm", None);
         Err(Error::KexInit)
     }
-
     #[allow(unused_variables)]
     fn dh_gex_set_group(&mut self, group: DhGroup) -> Result<(), Error> {
+        debug::log_kex_event("dh-gex", "dh_gex_set_group not implemented for this algorithm", None);
         Err(Error::KexInit)
     }
 
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    fn server_dh(&mut self, exchange: &mut Exchange, payload: &[u8]) -> Result<(), Error>;
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn server_dh(&mut self, exchange: &mut Exchange, payload: &[u8]) -> Result<(), Error> {
+        debug::log_kex_event("server", "processing DH exchange", None);
+        if debug::is_packet_logging_enabled() {
+            debug::log_packet(debug::SSHPacketType::Kex, "RECV", payload);
+        }
+        let result = self.server_dh_impl(exchange, payload);
+        if let Err(ref e) = result {
+            debug::log_ssh_error("server_dh", e);
+        } else {
+            debug::log_kex_event("server", "DH exchange processed successfully", None);
+        }
+        result
+    }
+
+    fn server_dh_impl(&mut self, exchange: &mut Exchange, payload: &[u8]) -> Result<(), Error>;
 
     fn client_dh(
         &mut self,
         client_ephemeral: &mut CryptoVec,
         writer: &mut impl Writer,
+    ) -> Result<(), Error> {
+        debug::log_kex_event("client", "initiating DH exchange", None);
+        let result = self.client_dh_impl(client_ephemeral, writer);
+        if let Err(ref e) = result {
+            debug::log_ssh_error("client_dh", e);
+        } else {
+            debug::log_kex_event("client", "DH exchange initiated successfully", None);
+        }
+        result
+    }
+
+    fn client_dh_impl(
+        &mut self,
+        client_ephemeral: &mut CryptoVec,
+        writer: &mut impl Writer,
     ) -> Result<(), Error>;
 
-    fn compute_shared_secret(&mut self, remote_pubkey_: &[u8]) -> Result<(), Error>;
+    fn compute_shared_secret(&mut self, remote_pubkey_: &[u8]) -> Result<(), Error> {
+        debug::log_kex_event("kex", "computing shared secret", None);
+        if debug::is_packet_logging_enabled() {
+            debug::log_event("kex", &format!("remote pubkey length: {} bytes", remote_pubkey_.len()), log::Level::Trace);
+        }
+        let result = self.compute_shared_secret_impl(remote_pubkey_);
+        if let Err(ref e) = result {
+            debug::log_ssh_error("compute_shared_secret", e);
+        } else {
+            debug::log_kex_event("kex", "shared secret computed successfully", None);
+        }
+        result
+    }
 
+    fn compute_shared_secret_impl(&mut self, remote_pubkey_: &[u8]) -> Result<(), Error>;
     fn compute_exchange_hash(
         &self,
         key: &CryptoVec,
         exchange: &Exchange,
         buffer: &mut CryptoVec,
-    ) -> Result<CryptoVec, Error>;
+    ) -> Result<CryptoVec, Error> {
+        debug::log_kex_event("kex", "computing exchange hash", None);
+        let result = self.compute_exchange_hash_impl(key, exchange, buffer);
+        match result {
+            Ok(ref hash) => {
+                debug::log_kex_event("kex", &format!("exchange hash computed ({} bytes)", hash.len()), None);
+                if debug::is_packet_logging_enabled() {
+                    debug::log_event("kex", &format!("exchange hash: {}", debug::hexdump(hash, 0)), log::Level::Trace);
+                }
+            },
+            Err(ref e) => debug::log_ssh_error("compute_exchange_hash", e),
+        }
+        result
+    }
 
+    fn compute_exchange_hash_impl(
+        &self,
+        key: &CryptoVec,
+        exchange: &Exchange,
+        buffer: &mut CryptoVec,
+    ) -> Result<CryptoVec, Error>;
     fn compute_keys(
         &self,
         session_id: &CryptoVec,
@@ -194,6 +285,37 @@ pub(crate) trait KexAlgorithmImplementor {
         remote_to_local_mac: mac::Name,
         local_to_remote_mac: mac::Name,
         is_server: bool,
+    ) -> Result<super::cipher::CipherPair, Error> {
+        debug::log_kex_event("kex", &format!("computing keys with cipher: {}", cipher.as_ref()), None);
+        debug::log_event("kex", &format!("MACs: remote→local={}, local→remote={}", 
+            remote_to_local_mac.as_ref(), local_to_remote_mac.as_ref()), log::Level::Debug);
+        
+        let result = self.compute_keys_impl(
+            session_id,
+            exchange_hash,
+            cipher,
+            remote_to_local_mac,
+            local_to_remote_mac,
+            is_server,
+        );
+        
+        match &result {
+            Ok(_) => debug::log_kex_event("kex", "keys computed successfully", None),
+            Err(e) => debug::log_ssh_error("compute_keys", e),
+        }
+        
+        result
+    }
+
+    fn compute_keys_impl(
+        &self,
+        session_id: &CryptoVec,
+        exchange_hash: &CryptoVec,
+        cipher: cipher::Name,
+        remote_to_local_mac: mac::Name,
+        local_to_remote_mac: mac::Name,
+        is_server: bool,
+    ) -> Result<super::cipher::CipherPair, Error>;
     ) -> Result<super::cipher::CipherPair, Error>;
 }
 
@@ -214,11 +336,7 @@ impl Encode for Name {
 
 impl TryFrom<&str> for Name {
     type Error = ();
-    fn try_from(s: &str) -> Result<Name, ()> {
-        KEXES.keys().find(|x| x.0 == s).map(|x| **x).ok_or(())
-    }
-}
-
+impl TryFrom<&str> for Name {
 /// `curve25519-sha256`
 pub const CURVE25519: Name = Name("curve25519-sha256");
 /// `curve25519-sha256@libssh.org`

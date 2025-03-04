@@ -19,9 +19,11 @@ use std::mem::replace;
 use std::num::Wrapping;
 
 use byteorder::{BigEndian, ByteOrder};
-use log::{debug, trace};
+use log::{debug, error, info, trace, warn};
 use ssh_encoding::Encode;
 use tokio::sync::oneshot;
+
+use crate::debug;
 
 use crate::cipher::OpeningKey;
 use crate::client::GexParams;
@@ -120,27 +122,72 @@ impl ChannelFlushResult {
 
 impl<C> CommonSession<C> {
     pub fn newkeys(&mut self, newkeys: NewKeys) {
+        debug::log_event("SESSION", "Installing new keys", log::Level::Debug);
+        debug::log_event(
+            "SESSION",
+            &format!(
+                "New keys details: kex={:?}, key_index={}, session_id_len={}",
+                newkeys.kex,
+                newkeys.key,
+                newkeys.session_id.len()
+            ),
+            log::Level::Trace
+        );
+        
         if let Some(ref mut enc) = self.encrypted {
             enc.exchange = Some(newkeys.exchange);
             enc.kex = newkeys.kex;
             enc.key = newkeys.key;
             enc.client_mac = newkeys.names.client_mac;
             enc.server_mac = newkeys.names.server_mac;
+            debug::log_event(
+                "SESSION", 
+                &format!(
+                    "New keys installed: client_mac={:?}, server_mac={:?}, strict_kex={}", 
+                    newkeys.names.client_mac, 
+                    newkeys.names.server_mac,
+                    self.strict_kex || newkeys.names.strict_kex
+                ), 
+                log::Level::Debug
+            );
             self.remote_to_local = newkeys.cipher.remote_to_local;
             self.packet_writer
                 .set_cipher(newkeys.cipher.local_to_remote);
             self.strict_kex = self.strict_kex || newkeys.names.strict_kex;
+            
+            debug::log_event(
+                "SESSION",
+                &format!(
+                    "Cipher transition complete: strict_kex={}",
+                    self.strict_kex
+                ),
+                log::Level::Debug
+            );
+        } else {
+            debug::log_event("SESSION", "Failed to install new keys: session not encrypted", log::Level::Warn);
         }
     }
 
     pub fn encrypted(&mut self, state: EncryptedState, newkeys: NewKeys) {
+        debug::log_event("SESSION", "Initializing encrypted session", log::Level::Info);
+        debug::log_event(
+            "SESSION", 
+            &format!(
+                "Session state: {:?}, compression: client={:?}, server={:?}", 
+                state,
+                newkeys.names.client_compression,
+                newkeys.names.server_compression
+            ), 
+            log::Level::Debug
+        );
+        
         self.encrypted = Some(Encrypted {
             exchange: Some(newkeys.exchange),
             kex: newkeys.kex,
             key: newkeys.key,
             client_mac: newkeys.names.client_mac,
             server_mac: newkeys.names.server_mac,
-            session_id: newkeys.session_id,
+            session_id: newkeys.session_id.clone(),
             state,
             channels: HashMap::new(),
             last_channel_id: Wrapping(1),
@@ -156,6 +203,12 @@ impl<C> CommonSession<C> {
         self.packet_writer
             .set_cipher(newkeys.cipher.local_to_remote);
         self.strict_kex = newkeys.names.strict_kex;
+        
+        debug::log_event(
+            "SESSION", 
+            &format!("Encrypted session initialized with ID: {:?}", newkeys.session_id),
+            log::Level::Info
+        );
     }
 
     /// Send a disconnect message.
@@ -165,6 +218,12 @@ impl<C> CommonSession<C> {
         description: &str,
         language_tag: &str,
     ) -> Result<(), crate::Error> {
+        debug::log_event(
+            "SESSION",
+            &format!("Disconnecting session: reason={:?}, description='{}'", reason, description),
+            log::Level::Info
+        );
+        
         let disconnect = |buf: &mut CryptoVec| {
             push_packet!(buf, {
                 msg::DISCONNECT.encode(buf)?;
@@ -176,12 +235,22 @@ impl<C> CommonSession<C> {
         };
         if !self.disconnected {
             self.disconnected = true;
-            return if let Some(ref mut enc) = self.encrypted {
+            let result = if let Some(ref mut enc) = self.encrypted {
                 disconnect(&mut enc.write)
             } else {
                 disconnect(&mut self.packet_writer.buffer().buffer)
             };
+            
+            if let Err(ref e) = result {
+                debug::log_ssh_error("disconnect", e);
+            } else {
+                debug::log_event("SESSION", "Disconnect message sent successfully", log::Level::Debug);
+            }
+            
+            return result;
         }
+        
+        debug::log_event("SESSION", "Session already disconnected", log::Level::Debug);
         Ok(())
     }
 
@@ -193,38 +262,59 @@ impl<C> CommonSession<C> {
         }
         Ok(())
     }
-
     pub(crate) fn reset_seqn(&mut self) {
+        debug::log_event("SESSION", "Resetting sequence numbers", log::Level::Debug);
         self.packet_writer.reset_seqn();
     }
+    
+    pub fn is_authenticated(&self) -> bool {
+        if let Some(ref enc) = self.encrypted {
+            if let EncryptedState::Authenticated = enc.state {
+                debug::log_event("SESSION", "Session is authenticated", log::Level::Trace);
+                return true;
+            }
+        }
+        debug::log_event("SESSION", "Session is not authenticated", log::Level::Trace);
+        false
+    }
 }
-
 impl Encrypted {
     pub fn byte(&mut self, channel: ChannelId, msg: u8) -> Result<(), crate::Error> {
+        debug::log_channel_event(channel.0, &format!("Sending byte message: {}", msg), None);
         if let Some(channel) = self.channels.get(&channel) {
             push_packet!(self.write, {
                 self.write.push(msg);
                 channel.recipient_channel.encode(&mut self.write)?;
             });
+            debug::log_channel_event(channel.recipient_channel, &format!("Byte sent to recipient"), None);
+        } else {
+            debug::log_channel_event(channel.0, "Failed to send byte: channel not found", None);
         }
         Ok(())
     }
 
     pub fn eof(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        debug::log_channel_event(channel.0, "EOF", None);
         if let Some(channel) = self.has_pending_data_mut(channel) {
             channel.pending_eof = true;
+            debug::log_channel_event(channel.sender_channel.0, "Pending EOF (has data)", None);
         } else {
+            debug::log_channel_event(channel.0, "Sending EOF", None);
             self.byte(channel, msg::CHANNEL_EOF)?;
         }
         Ok(())
     }
 
     pub fn close(&mut self, channel: ChannelId) -> Result<(), crate::Error> {
+        debug::log_channel_event(channel.0, "CLOSE", None);
         if let Some(channel) = self.has_pending_data_mut(channel) {
             channel.pending_close = true;
+            debug::log_channel_event(channel.sender_channel.0, "Pending CLOSE (has data)", None);
         } else {
+            debug::log_channel_event(channel.0, "Sending CLOSE", None);
             self.byte(channel, msg::CHANNEL_CLOSE)?;
             self.channels.remove(&channel);
+            debug::log_channel_event(channel.0, "Removed from session", None);
         }
         Ok(())
     }
@@ -236,7 +326,6 @@ impl Encrypted {
             0
         }
     }
-
     pub fn adjust_window_size(
         &mut self,
         channel: ChannelId,
@@ -244,6 +333,17 @@ impl Encrypted {
         target: u32,
     ) -> Result<bool, crate::Error> {
         if let Some(channel) = self.channels.get_mut(&channel) {
+            debug::log_channel_event(
+                channel.sender_channel.0,
+                &format!(
+                    "Adjusting window size: current={}, target={}, data_len={}",
+                    channel.sender_window_size,
+                    target,
+                    data.len()
+                ),
+                None
+            );
+            
             trace!(
                 "adjust_window_size, channel = {}, size = {},",
                 channel.sender_channel,
@@ -253,7 +353,23 @@ impl Encrypted {
             // https://tools.ietf.org/html/rfc4254#section-5.2
             if data.len() as u32 <= channel.sender_window_size {
                 channel.sender_window_size -= data.len() as u32;
+                debug::log_channel_event(
+                    channel.sender_channel.0,
+                    &format!("Window size reduced to: {}", channel.sender_window_size),
+                    None
+                );
+            } else {
+                debug::log_channel_event(
+                    channel.sender_channel.0,
+                    &format!(
+                        "Data exceeds window size: data_len={}, window_size={}",
+                        data.len(),
+                        channel.sender_window_size
+                    ),
+                    log::Level::Warn
+                );
             }
+            
             if channel.sender_window_size < target / 2 {
                 debug!(
                     "sender_window_size {:?}, target {:?}",
@@ -264,9 +380,27 @@ impl Encrypted {
                     channel.recipient_channel.encode(&mut self.write)?;
                     (target - channel.sender_window_size).encode(&mut self.write)?;
                 });
+                
+                debug::log_channel_event(
+                    channel.sender_channel.0,
+                    &format!(
+                        "Sent window adjust: old={}, new={}, adjustment={}",
+                        channel.sender_window_size,
+                        target,
+                        target - channel.sender_window_size
+                    ),
+                    None
+                );
+                
                 channel.sender_window_size = target;
                 return Ok(true);
             }
+        } else {
+            debug::log_channel_event(
+                channel.0,
+                "Failed to adjust window size: channel not found",
+                log::Level::Warn
+            );
         }
         Ok(false)
     }
@@ -407,21 +541,8 @@ impl Encrypted {
         buf0: CryptoVec,
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
-        if let Some(channel) = self.channels.get_mut(&channel) {
-            assert!(channel.confirmed);
-            if !channel.pending_data.is_empty() && is_rekeying {
-                channel.pending_data.push_back((buf0, None, 0));
-                return Ok(());
-            }
-            let buf_len = Self::data_noqueue(&mut self.write, channel, &buf0, None, 0)?;
-            if buf_len < buf0.len() {
-                channel.pending_data.push_back((buf0, None, buf_len))
-            }
-        } else {
-            debug!("{:?} not saved for this session", channel);
-        }
-        Ok(())
-    }
+        if debug::is_packet_logging_enabled() {
+            trace!("Channel data: id={:?}, len={}, rekeying={}",
 
     pub fn extended_data(
         &mut self,
@@ -430,20 +551,35 @@ impl Encrypted {
         buf0: CryptoVec,
         is_rekeying: bool,
     ) -> Result<(), crate::Error> {
+        debug::log_channel_event(
+            channel.0,
+            &format!(
+                "Sending extended data: ext={}, len={}, rekeying={}",
+                ext,
+                buf0.len(),
+                is_rekeying
+            ),
+            None
+        );
+        
         if let Some(channel) = self.channels.get_mut(&channel) {
             assert!(channel.confirmed);
+            
             if !channel.pending_data.is_empty() && is_rekeying {
+                debug::log_channel_event(
+                    channel.sender_channel.0,
+                    &format!(
+                        "Queuing extended data during rekey: ext={}, len={}",
+                        ext,
+                        buf0.len()
+                    ),
+                    None
+                );
                 channel.pending_data.push_back((buf0, Some(ext), 0));
                 return Ok(());
             }
-            let buf_len = Self::data_noqueue(&mut self.write, channel, &buf0, Some(ext), 0)?;
-            if buf_len < buf0.len() {
-                channel.pending_data.push_back((buf0, Some(ext), buf_len))
-            }
-        }
-        Ok(())
-    }
-
+            
+            let buf_
     pub fn flush(
         &mut self,
         limits: &Limits,

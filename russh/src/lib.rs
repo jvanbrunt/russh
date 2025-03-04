@@ -154,6 +154,9 @@ pub mod server;
 /// Client side of this library.
 pub mod client;
 
+/// Debug utilities for SSH connections
+pub mod debug;
+
 #[derive(Debug)]
 pub enum AlgorithmKind {
     Kex,

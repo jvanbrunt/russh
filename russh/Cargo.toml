@@ -50,6 +50,7 @@ hex-literal = "0.4"
 hmac.workspace = true
 inout = { version = "0.1", features = ["std"] }
 log.workspace = true
+env_logger.workspace = true
 md5 = "0.7"
 num-bigint = { version = "0.4.2", features = ["rand"] }
 # num-integer = "0.1"
@@ -128,5 +129,14 @@ name = "sftp_server"
 path = "examples/sftp_server.rs"
 required-features = ["async-trait"]
 
+[[example]]
+name = "debug_client_example"
+path = "examples/debug_client_example.rs"
+
+[[example]]
+name = "debug_server_example"
+path = "examples/debug_server_example.rs"
+
 [package.metadata.docs.rs]
 all-features = true
+
